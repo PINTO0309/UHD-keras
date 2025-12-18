@@ -27,6 +27,8 @@ dependencies = [
     "ai-edge-litert==1.2.0",
     "ml_dtypes==0.5.1",
     "tf2onnx==1.16.1",
+    "tensorflow-model-optimization==0.8.0",
+    "tflite-micro==0.dev20251210174019",
 ]
 [tool.uv]
 override-dependencies = [

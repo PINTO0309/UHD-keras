@@ -1,3 +1,4 @@
+# WIP
 # UHD-keras
 
 Keras reimplementation of the UHD `ultratinyod` training pipeline. The goal is to keep the original training flow (anchors, SimOTA/legacy assigner, IoU-aware heads, improved head, and quality-aware scoring) while restricting the scope to the `ultratinyod` architecture. Distillation supports only UltraTinyOD teacher→student; transformer teachers are intentionally unsupported. EMA tracking and multiple resize backends are available.
@@ -33,14 +34,38 @@ Notes:
 
 ## Training (student only)
 ```bash
+SIZE=64x64
+ANCHOR=8
+CNNWIDTH=64
+LR=0.0003
+RESIZEMODE=opencv_inter_nearest
 uv run python -m uhd_keras.train \
 --image-dir data/wholebody34/obj_train_data \
---names data/wholebody34/obj.names \
---epochs 50 \
+--img-size ${SIZE} \
+--exp-name ultratinyod_res_anc${ANCHOR}_w${CNNWIDTH}_loese_${SIZE}_lr${LR}_${RESIZEMODE} \
 --batch-size 64 \
---img-size 64 \
---resize-mode opencv_inter_nearest \
---ckpt-out runs/ultratinyod_keras_best
+--epochs 300 \
+--lr ${LR} \
+--weight-decay 0.0001 \
+--classes 0 \
+--cnn-width ${CNNWIDTH} \
+--auto-anchors \
+--num-anchors ${ANCHOR} \
+--iou-loss ciou \
+--conf-thresh 0.15 \
+--use-ema \
+--ema-decay 0.9999 \
+--grad-clip-norm 10.0 \
+--use-batchnorm \
+--utod-residual \
+--use-improved-head \
+--use-iou-aware-head \
+--utod-head-ese \
+--activation relu \
+--utod-large-obj-branch \
+--utod-large-obj-depth 2 \
+--utod-large-obj-ch-scale 1.25 \
+--${RESIZEMODE}
 ```
 
 Common knobs:
@@ -71,7 +96,48 @@ Teacher and student share the same UltraTinyOD config; transformer teachers are 
 ## EMA tracking
 Add `--use-ema --ema-decay 0.9999` to maintain and save EMA weights (EMA weights are swapped in only for checkpoint writing).
 
-## Notes
-- Training loop runs in eager mode to keep the anchor assigner logic simple.
-- Checkpoints are written whenever the running best loss improves; `--resume` can restore a student.
-- Only `ultratinyod` is implemented; other UHD architectures are intentionally left out.
+## Inspect Anchors/wh_scale
+
+```bash
+uv run python tools/inspect_checkpoint.py \
+runs/ultratinyod_res_anc8_w64_loese_64x64_lr0.0003_opencv_inter_nearest/last_utod_0001_map_0.00000.keras
+```
+```
+=== Anchors ===
+[[0.02343096 0.04865872]
+ [0.04480992 0.10889184]
+ [0.08770896 0.16278133]
+ [0.09427162 0.3447917 ]
+ [0.21822597 0.32518694]
+ [0.17143537 0.61753505]
+ [0.34108981 0.6963622 ]
+ [0.6419175  0.81884986]]
+
+=== wh_scale ===
+[[1.0001173  1.0001669 ]
+ [1.0002174  1.0002654 ]
+ [1.0002551  1.000126  ]
+ [1.0000645  1.0001314 ]
+ [0.99998957 1.0000978 ]
+ [0.9999818  1.0000243 ]
+ [0.9999917  0.99985534]
+ [0.9999727  0.9999857 ]]
+```
+
+## ONNX Export
+
+```bash
+SIZE=64x64
+ANCHOR=8
+CNNWIDTH=64
+LR=0.0003
+RESIZEMODE=opencv_inter_nearest
+uv run python -m tf2onnx.convert \
+--saved-model runs/ultratinyod_res_anc${ANCHOR}_w${CNNWIDTH}_loese_${SIZE}_lr${LR}_${RESIZEMODE}/best_utod_0001_map_0.00000 \
+--output model.onnx \
+--inputs-as-nchw input_1 \
+--outputs-as-nchw output_0 \
+--opset 17
+uv run onnxsim model.onnx model.onnx \
+--overwrite-input-shape "input_1:1,3,64,64"
+```

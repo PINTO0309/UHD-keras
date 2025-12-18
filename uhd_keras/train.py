@@ -6,11 +6,14 @@ import os
 import random
 import logging
 import warnings
+import sys
 from dataclasses import dataclass
 from typing import List, Optional, Sequence, Tuple, Union
 
 # Reduce TensorFlow log noise (suppress info/warnings) before TF import
 os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+os.environ.setdefault("GLOG_minloglevel", "3")
+os.environ.setdefault("TF_CPP_MIN_VLOG_LEVEL", "0")
 warnings.simplefilter(action="ignore", category=FutureWarning)
 warnings.simplefilter(action="ignore", category=Warning)
 warnings.simplefilter(action="ignore", category=DeprecationWarning)
@@ -18,19 +21,62 @@ warnings.simplefilter(action="ignore", category=RuntimeWarning)
 
 import numpy as np
 import tensorflow as tf
+gpus = tf.config.experimental.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+    except RuntimeError as e:
+        print(e)
 import tf_keras as keras
 import yaml
 from tqdm import tqdm
 from absl import logging as absl_logging
 
-tf.get_logger().setLevel("FATAL")
+logger = tf.get_logger()
+logger.setLevel(logging.FATAL)
 tf.autograph.set_verbosity(0)
-logging.getLogger("tensorflow").setLevel(logging.FATAL)
 absl_logging.set_verbosity(absl_logging.FATAL)
+try:
+    logger.handlers.clear()
+    logger.propagate = False
+except Exception:
+    pass
 try:
     tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.FATAL)
 except Exception:
     pass
+
+
+class _FilteredStderr:
+    """Suppress specific TensorFlow C++ noise."""
+
+    def __init__(self, wrapped):
+        self._wrapped = wrapped
+        self._block_substrings = [
+            "local_rendezvous.cc:407",
+            "OUT_OF_RANGE: End of sequence",
+            "computation placer already registered",
+            "Unable to register cuDNN factory",
+            "Unable to register cuBLAS factory",
+            "Unable to register cuFFT factory",
+        ]
+
+    def write(self, data):
+        for sub in self._block_substrings:
+            if sub in data:
+                return
+        return self._wrapped.write(data)
+
+    def flush(self):
+        try:
+            return self._wrapped.flush()
+        except Exception:
+            return None
+
+
+# Redirect stderr to filter noisy TF C++ logs
+sys.stderr = _FilteredStderr(sys.stderr)
 
 from .data import build_dataset
 from .distill import distillation_loss
@@ -359,12 +405,14 @@ class Trainer:
         self.best_loss = float("inf")
         self.best_map = float("-inf")
         self.use_amp = cfg.use_amp
+        self.fwd_fn = self._build_fwd_fn()
         self.train_step_fn = self._build_train_step(jit=cfg.use_xla)
         self.writer = tf.summary.create_file_writer(cfg.log_dir)
         self.text_log_path = os.path.join(cfg.log_dir, "train.log")
         os.makedirs(cfg.log_dir, exist_ok=True)
         with open(self.text_log_path, "w", encoding="utf-8") as f:
-            f.write("step,epoch,loss,box,obj,cls,quality,val_loss,val_map\n")
+            f.write(json.dumps(cfg.__dict__, indent=2) + "\n")
+            f.write("epoch,loss,box,obj,cls,quality,val_loss,val_map\n")
         self.ckpt_base = cfg.ckpt_out or os.path.join("runs", cfg.exp_name or "ultratinyod")
         self.best_dir = self.ckpt_base
         self.last_dir = self.ckpt_base
@@ -384,7 +432,7 @@ class Trainer:
             seed=self.cfg.seed,
             num_workers=self.cfg.num_workers,
             aug_cfg=self.aug_cfg,
-            cache=False,
+            cache=True,
         )
         val_ds = None
         if val_paths:
@@ -408,7 +456,11 @@ class Trainer:
         for epoch in range(1, self.cfg.epochs + 1):
             steps_per_epoch = tf.data.experimental.cardinality(ds).numpy()
             total_steps = steps_per_epoch if steps_per_epoch and steps_per_epoch > 0 else None
-            pbar = tqdm(ds, total=total_steps, desc=f"Epoch {epoch}", leave=False)
+            pbar = tqdm(ds, total=total_steps, desc=f"Epoch {epoch}", leave=False, file=sys.stdout)
+            val_map_val = 0.0
+            epoch_totals = {}
+            epoch_count = 0
+            train_vals = {"loss": 0.0, "box": 0.0, "obj": 0.0, "cls": 0.0, "quality": 0.0}
             for batch in pbar:
                 global_step += 1
                 targets = _targets_from_batch(batch, class_map=self.class_map)
@@ -416,71 +468,84 @@ class Trainer:
                 if self.ema:
                     self.ema.update()
                 loss_value = float(loss.numpy())
+                for k, v in loss_dict.items():
+                    epoch_totals[k] = epoch_totals.get(k, 0.0) + float(v.numpy())
+                epoch_count += 1
 
                 if global_step % self.cfg.log_interval == 0:
                     loss_vals = {k: float(v.numpy()) for k, v in loss_dict.items()}
                     pbar.set_postfix(
                         {
-                            "step": global_step,
-                            "loss": f"{loss_vals.get('loss', 0):.4f}",
-                            "box": f"{loss_vals.get('box', 0):.4f}",
-                            "obj": f"{loss_vals.get('obj', 0):.4f}",
-                            "cls": f"{loss_vals.get('cls', 0):.4f}",
-                            "qual": f"{loss_vals.get('quality', 0):.4f}",
+                            "loss": f"{loss_vals.get('loss', 0):.5f}",
+                            "box": f"{loss_vals.get('box', 0):.5f}",
+                            "obj": f"{loss_vals.get('obj', 0):.5f}",
+                            "cls": f"{loss_vals.get('cls', 0):.5f}",
+                            "qual": f"{loss_vals.get('quality', 0):.5f}",
                         }
                     )
-                    with self.writer.as_default():
-                        for k, v in loss_vals.items():
-                            tf.summary.scalar(f"train/{k}", v, step=global_step)
-                    with open(self.text_log_path, "a", encoding="utf-8") as f:
-                        f.write(
-                            f"{global_step},{epoch},"
-                            f"{loss_vals.get('loss', 0):.6f},"
-                            f"{loss_vals.get('box', 0):.6f},"
-                            f"{loss_vals.get('obj', 0):.6f},"
-                            f"{loss_vals.get('cls', 0):.6f},"
-                            f"{loss_vals.get('quality', 0):.6f},"
-                            f"{0.0},{0.0}\n"
-                        )
+                    # skip per-step TensorBoard logging; epoch-level only
 
-                loss_value = float(loss.numpy())
+            if epoch_count > 0:
+                avg_losses = {k: v / epoch_count for k, v in epoch_totals.items()}
+                with self.writer.as_default():
+                    order = ["loss", "box", "cls", "obj", "quality"]
+                    for idx, k in enumerate(order, start=1):
+                        if k in avg_losses:
+                            tf.summary.scalar(f"train/{idx:02d}_{k}", avg_losses[k], step=epoch)
+                    for k, v in avg_losses.items():
+                        if k not in order:
+                            tf.summary.scalar(f"train/{len(order)+1:02d}_{k}", v, step=epoch)
+                for k in train_vals.keys():
+                    train_vals[k] = float(avg_losses.get(k, 0.0))
+
             val_loss_val = None
+            val_map_val = 0.0
             if val_ds is not None and (epoch % max(1, self.cfg.eval_interval) == 0):
-                val_loss = self._run_eval(val_ds)
+                val_loss = self._run_eval(val_ds, epoch=epoch)
                 val_loss_val = float(val_loss.get("loss", 0.0))
                 val_map_val = float(val_loss.get("map", 0.0))
                 with self.writer.as_default():
+                    order = ["map", "loss", "box", "cls", "obj", "quality"]
+                    for idx, k in enumerate(order, start=1):
+                        if k in val_loss:
+                            tf.summary.scalar(f"val/{idx:02d}_{k}", val_loss[k], step=epoch)
                     for k, v in val_loss.items():
-                        tf.summary.scalar(f"val/{k}", v, step=epoch)
+                        if k not in order:
+                            tf.summary.scalar(f"val/{len(order)+1:02d}_{k}", v, step=epoch)
                 with open(self.text_log_path, "a", encoding="utf-8") as f:
                     f.write(
-                        f"{global_step},{epoch},"
-                        f"{0.0},{0.0},{0.0},{0.0},{0.0},"
+                        f"{epoch},"
+                        f"{train_vals['loss']:.6f},{train_vals['box']:.6f},{train_vals['obj']:.6f},{train_vals['cls']:.6f},{train_vals['quality']:.6f},"
                         f"{val_loss_val:.6f},{val_map_val:.6f}\n"
                     )
-                print(f"Epoch {epoch} val: loss={val_loss_val:.4f} mAP={val_map_val:.4f}")
+                print(f"Epoch {epoch} val: loss={val_loss_val:.5f} AP@0.5={val_map_val:.5f}")
                 if val_map_val > self.best_map:
                     self.best_map = val_map_val
                     self._save_best(val_map_val, epoch, global_step, metric_name="map")
                 elif val_loss_val < self.best_loss:
-                    # fallback to loss-based best if mAP does not improve
+                    # fallback to loss-based best if mAP does not improve (no file save)
                     self.best_loss = val_loss_val
-                    self._save_best(val_loss_val, epoch, global_step, metric_name="loss")
             # fallback: if no val, use train loss at epoch end
             if val_loss_val is None:
                 if loss_value < self.best_loss:
                     self.best_loss = loss_value
-                    self._save_best(loss_value, epoch, global_step, metric_name="loss")
-            self._save_last(epoch)
+                    # no file save for loss-only best
+                with open(self.text_log_path, "a", encoding="utf-8") as f:
+                    f.write(
+                        f"{epoch},"
+                        f"{train_vals['loss']:.6f},{train_vals['box']:.6f},{train_vals['obj']:.6f},{train_vals['cls']:.6f},{train_vals['quality']:.6f},"
+                        f"{0.0:.6f},{0.0:.6f}\n"
+                    )
+            self._save_last(epoch, map_value=val_map_val)
             print(f"Finished epoch {epoch}")
 
-    def _run_eval(self, val_ds) -> dict:
+    def _run_eval(self, val_ds, epoch: int = 0) -> dict:
         totals = {}
         count = 0
         all_preds = []
         gt_store = {}
         img_offset = 0
-        for batch in val_ds:
+        for batch in tqdm(val_ds, desc=f"Val {epoch}", leave=False, file=sys.stdout):
             targets = _targets_from_batch(batch, class_map=self.class_map)
             raw, decoded = self.model(batch["image"], training=False, decode=True)
             loss_dict = anchor_loss(
@@ -521,56 +586,61 @@ class Trainer:
         return avg
 
     def _save_weights(self, base_path: str):
-        """Save both .keras (Keras v3 format) and SavedModel (directory)."""
+        """Save checkpoint (Keras v3 single-file only)."""
         if self.ema:
             self.ema.apply_shadow()
         keras_path = f"{base_path}.keras"
-        sm_path = f"{base_path}_saved_model"
-        # ensure parent exists
         os.makedirs(os.path.dirname(keras_path) or ".", exist_ok=True)
         import io
         import contextlib
 
-        # Keras v3 single-file
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.model.save(keras_path)
-        # SavedModel directory
-        if os.path.exists(sm_path):
-            if os.path.isdir(sm_path):
-                for root, dirs, files in os.walk(sm_path, topdown=False):
+        if self.ema:
+            self.ema.restore()
+
+    def _save_saved_model(self, export_dir: str):
+        if self.ema:
+            self.ema.apply_shadow()
+        if os.path.exists(export_dir):
+            if os.path.isdir(export_dir):
+                for root, dirs, files in os.walk(export_dir, topdown=False):
                     for f in files:
                         os.remove(os.path.join(root, f))
                     for d in dirs:
                         os.rmdir(os.path.join(root, d))
-                os.rmdir(sm_path)
+                os.rmdir(export_dir)
             else:
-                os.remove(sm_path)
+                os.remove(export_dir)
+        import io
+        import contextlib
+
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             if hasattr(self.model, "export"):
-                self.model.export(sm_path)
+                self.model.export(export_dir)
             else:
-                tf.saved_model.save(self.model, sm_path)
+                tf.saved_model.save(self.model, export_dir)
         if self.ema:
             self.ema.restore()
 
     def _save_best(self, metric_value: float, epoch: int, step: int, metric_name: str = "loss"):
-        if metric_name == "map":
-            base = f"best_utod_{epoch:04d}_map_{metric_value:.5f}"
-            prefix = "best_utod_"
-        else:
-            base = f"best_utod_{epoch:04d}_{metric_name}_{metric_value:.5f}"
-            prefix = "best_utod_"
+        if metric_name != "map":
+            print(f"Best {metric_name} updated to {metric_value:.5f} (no best file saved for non-mAP metrics).")
+            return
+        base = f"best_utod_{epoch:04d}_map_{metric_value:.5f}"
+        prefix = "best_utod_"
         path = os.path.join(self.best_dir, base)
         self._save_weights(path)
-        latest = os.path.join(self.best_dir, "best")
-        self._save_weights(latest)
+        sm_path = os.path.join(self.best_dir, base)
+        self._save_saved_model(sm_path)
         self._prune_dir(self.best_dir, prefix=prefix, keep=10)
-        print(f"Saved best checkpoint to {path}.keras ({metric_name}={metric_value:.4f})")
+        print(f"Saved best checkpoint to {path}.keras ({metric_name}={metric_value:.5f})")
 
-    def _save_last(self, epoch: int):
-        base = f"last_e{epoch:04d}"
+    def _save_last(self, epoch: int, map_value: float = 0.0):
+        base = f"last_utod_{epoch:04d}_map_{map_value:.5f}"
         path = os.path.join(self.last_dir, base)
         self._save_weights(path)
+        self._save_saved_model(path)
         self._prune_dir(self.last_dir, prefix="last_", keep=10)
 
     def _prune_dir(self, directory: str, prefix: str, keep: int = 10):
@@ -582,8 +652,6 @@ class Trainer:
             base = name
             if base.endswith(".keras"):
                 base = base[:-6]
-            if base.endswith("_saved_model"):
-                base = base.replace("_saved_model", "")
             full = os.path.join(directory, name)
             try:
                 mtime = os.path.getmtime(full)
@@ -593,7 +661,7 @@ class Trainer:
         entries = sorted(grouped.items(), key=lambda x: x[1], reverse=True)
         for base, _ in entries[keep:]:
             keras_path = os.path.join(directory, f"{base}.keras")
-            sm_path = os.path.join(directory, f"{base}_saved_model")
+            sm_path = os.path.join(directory, base)
             for path in (keras_path, sm_path):
                 if not os.path.exists(path):
                     continue
@@ -708,13 +776,14 @@ class Trainer:
         class_map = self.class_map
         anchors = model.anchors
         has_quality = model.has_quality_head
+        fwd_fn = self.fwd_fn
 
         if jit:
             print("Warning: XLA/graph mode is not fully supported; running eager train step instead.")
 
         def step(batch, targets):
             with tf.GradientTape() as tape:
-                pred, feat = model(batch["image"], training=True, return_feat=True)
+                pred, feat = fwd_fn(batch["image"])
                 loss_dict = anchor_loss(
                     pred,
                     targets,
@@ -756,6 +825,16 @@ class Trainer:
 
         return step
 
+    def _build_fwd_fn(self):
+        @tf.function(input_signature=[tf.TensorSpec(shape=[None, None, None, 3], dtype=tf.float32)])
+        def forward_fn(images):
+            x = images
+            if self.use_amp:
+                x = tf.cast(x, tf.float16)
+            return self.model(x, training=True, return_feat=True)
+
+        return forward_fn
+
 
 def build_argparser():
     parser = argparse.ArgumentParser(description="Train UltraTinyOD (Keras)")
@@ -763,7 +842,7 @@ def build_argparser():
     parser.add_argument("--names", dest="names_path", default=None, help="obj.names file to set class count")
     parser.add_argument("--num-classes", type=int, default=None, help="Override class count")
     parser.add_argument("--classes", type=str, default=None, help="Comma-separated subset of class ids to use")
-    parser.add_argument("--aug-config", type=str, default=None, help="YAML file with data_augment config (UHD format)")
+    parser.add_argument("--aug-config", type=str, default="uhd_keras/aug.yaml", help="YAML file with data_augment config (UHD format)")
     parser.add_argument("--no-aug", action="store_true", help="Disable augmentation")
     parser.add_argument("--exp-name", type=str, default=None, help="Experiment name for outputs (ckpt/log dirs)")
     parser.add_argument("--train-split", type=float, default=0.8, help="Train split ratio")

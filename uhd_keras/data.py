@@ -177,8 +177,8 @@ def build_dataset(
     if shuffle:
         ds = ds.shuffle(buffer_size=max(1024, len(paths)), seed=seed, reshuffle_each_iteration=True)
     npc = tf.data.AUTOTUNE if num_workers in (None, 0, -1) else int(num_workers)
-    ds = ds.map(_loader, num_parallel_calls=tf.data.AUTOTUNE)
-    ds = ds.map(lambda i, b, l, n: {"image": i, "boxes": b, "labels": l, "num_boxes": n}, num_parallel_calls=tf.data.AUTOTUNE)
+    ds = ds.map(_loader, num_parallel_calls=npc)
+    ds = ds.map(lambda i, b, l, n: {"image": i, "boxes": b, "labels": l, "num_boxes": n}, num_parallel_calls=npc)
     if cache:
         ds = ds.cache()
     ds = ds.batch(batch_size, drop_remainder=True)

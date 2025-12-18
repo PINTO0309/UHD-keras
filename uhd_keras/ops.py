@@ -98,6 +98,8 @@ def decode_anchor(
     bsz = tf.shape(pred)[0]
     h = tf.shape(pred)[1]
     w = tf.shape(pred)[2]
+    h64 = tf.cast(h, tf.int64)
+    w64 = tf.cast(w, tf.int64)
     anchors = tf.cast(tf.convert_to_tensor(anchors), pred.dtype)
     if wh_scale is not None:
         anchors = anchors * tf.cast(wh_scale, pred.dtype)
@@ -156,11 +158,11 @@ def decode_anchor(
             continue
         sel_scores = tf.boolean_mask(max_scores, mask)
         sel_cls = tf.boolean_mask(max_cls, mask)
-        idxs = tf.where(mask)[:, 0]
-        a_idx = idxs // (h * w)
-        rem = idxs % (h * w)
-        gy_idx = rem // w
-        gx_idx = rem % w
+        idxs = tf.cast(tf.where(mask)[:, 0], tf.int64)
+        a_idx = idxs // (h64 * w64)
+        rem = idxs % (h64 * w64)
+        gy_idx = rem // w64
+        gx_idx = rem % w64
         cx_sel = tf.gather_nd(pred_cx_b, tf.stack([gy_idx, gx_idx, a_idx], axis=1))
         cy_sel = tf.gather_nd(pred_cy_b, tf.stack([gy_idx, gx_idx, a_idx], axis=1))
         bw_sel = tf.gather_nd(pred_w_b, tf.stack([gy_idx, gx_idx, a_idx], axis=1))
