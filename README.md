@@ -41,15 +41,15 @@ Notes:
 ```bash
 SIZE=64x64
 ANCHOR=8
-CNNWIDTH=64
-LR=0.0003
+CNNWIDTH=16
+LR=0.0005
 RESIZEMODE=opencv_inter_nearest
 uv run python -m uhd_keras.train \
 --image-dir data/wholebody34/obj_train_data \
 --img-size ${SIZE} \
 --exp-name ultratinyod_res_anc${ANCHOR}_w${CNNWIDTH}_loese_${SIZE}_lr${LR}_${RESIZEMODE} \
 --batch-size 64 \
---epochs 300 \
+--epochs 500 \
 --lr ${LR} \
 --weight-decay 0.0001 \
 --classes 0 \
