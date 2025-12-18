@@ -456,7 +456,7 @@ class Trainer:
         for epoch in range(1, self.cfg.epochs + 1):
             steps_per_epoch = tf.data.experimental.cardinality(ds).numpy()
             total_steps = steps_per_epoch if steps_per_epoch and steps_per_epoch > 0 else None
-            pbar = tqdm(ds, total=total_steps, desc=f"Epoch {epoch}", leave=False, file=sys.stdout)
+            pbar = tqdm(ds, total=total_steps, desc=f"Epoch {epoch}", leave=False, file=sys.stdout, dynamic_ncols=True)
             val_map_val = 0.0
             epoch_totals = {}
             epoch_count = 0
@@ -545,7 +545,7 @@ class Trainer:
         all_preds = []
         gt_store = {}
         img_offset = 0
-        for batch in tqdm(val_ds, desc=f"Val {epoch}", leave=False, file=sys.stdout):
+        for batch in tqdm(val_ds, desc=f"Val {epoch}", leave=False, file=sys.stdout, dynamic_ncols=True):
             targets = _targets_from_batch(batch, class_map=self.class_map)
             raw, decoded = self.model(batch["image"], training=False, decode=True)
             loss_dict = anchor_loss(
