@@ -138,6 +138,36 @@ def _parse_img_size(val) -> Tuple[int, int]:
     return v, v
 
 
+def _find_resume_log(resume_path: Optional[str]) -> Optional[str]:
+    """Find train.log associated with a resume checkpoint by walking up directories."""
+    if not resume_path:
+        return None
+    cur = os.path.abspath(os.path.dirname(resume_path))
+    for _ in range(4):
+        cand = os.path.join(cur, "train.log")
+        if os.path.exists(cand):
+            return cand
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return None
+
+
+def _load_resume_config(resume_path: Optional[str]) -> tuple[Optional[dict], Optional[str]]:
+    """Load JSON config stored on the first line of train.log for the given checkpoint."""
+    log_path = _find_resume_log(resume_path)
+    if not log_path:
+        return None, None
+    try:
+        with open(log_path, "r", encoding="utf-8") as f:
+            first = f.readline()
+            cfg = json.loads(first)
+        return cfg, log_path
+    except Exception:
+        return None, log_path
+
+
 DEFAULT_AUG_CFG = {
     "RandomPhotometricDistort": {"prob": 0.5},
     "RandomHSV": {"prob": 0.75, "hue_gain": 0.015, "saturation_gain": 0.7, "value_gain": 0.4},
@@ -417,6 +447,59 @@ class Trainer:
         self.best_dir = self.ckpt_base
         self.last_dir = self.ckpt_base
         os.makedirs(self.ckpt_base, exist_ok=True)
+        self._setup_checkpoint()
+        self.start_epoch, self.global_step = self._restore_training_state(cfg.resume)
+
+    def _setup_checkpoint(self):
+        self.ckpt_global_step = tf.Variable(0, dtype=tf.int64, trainable=False, name="global_step")
+        self.ckpt_epoch = tf.Variable(0, dtype=tf.int64, trainable=False, name="epoch")
+        self.ckpt_best_map = tf.Variable(self.best_map, dtype=tf.float32, trainable=False, name="best_map")
+        self.ckpt_best_loss = tf.Variable(self.best_loss, dtype=tf.float32, trainable=False, name="best_loss")
+        ema_shadow = self.ema.shadow if self.ema else []
+        self.ckpt = tf.train.Checkpoint(
+            model=self.model,
+            optimizer=self.optimizer,
+            ema_shadow=ema_shadow,
+            global_step=self.ckpt_global_step,
+            epoch=self.ckpt_epoch,
+            best_map=self.ckpt_best_map,
+            best_loss=self.ckpt_best_loss,
+        )
+        self.state_dir = os.path.join(self.ckpt_base, "train_state")
+        os.makedirs(self.state_dir, exist_ok=True)
+        self.ckpt_manager = tf.train.CheckpointManager(self.ckpt, self.state_dir, max_to_keep=3, checkpoint_name="train_state")
+
+    def _restore_training_state(self, resume_path: Optional[str]) -> Tuple[int, int]:
+        start_epoch = 1
+        global_step = 0
+        if not resume_path:
+            return start_epoch, global_step
+        latest = self.ckpt_manager.latest_checkpoint if self.ckpt_manager else None
+        if latest:
+            status = self.ckpt.restore(latest)
+            try:
+                status.expect_partial()
+            except Exception:
+                pass
+            start_epoch = int(self.ckpt_epoch.numpy()) + 1
+            global_step = int(self.ckpt_global_step.numpy())
+            self.best_map = float(self.ckpt_best_map.numpy())
+            self.best_loss = float(self.ckpt_best_loss.numpy())
+            print(f"Restored training state from {latest} (epoch {start_epoch-1}, global_step {global_step}).")
+            return start_epoch, global_step
+        self.model.load_weights(resume_path)
+        print(f"Resumed weights from {resume_path} (no optimizer state found).")
+        return start_epoch, global_step
+
+    def _save_state(self, epoch: int, global_step: int):
+        if not self.ckpt_manager:
+            return
+        self.ckpt_epoch.assign(epoch)
+        self.ckpt_global_step.assign(global_step)
+        self.ckpt_best_map.assign(self.best_map)
+        self.ckpt_best_loss.assign(self.best_loss)
+        path = self.ckpt_manager.save(checkpoint_number=global_step)
+        print(f"Saved training state to {path}")
 
     def train(self):
         train_paths, val_paths = self._split_paths(self.cfg.image_dir, self.cfg.train_split, self.cfg.val_split)
@@ -452,8 +535,8 @@ class Trainer:
         if ckpt_dir:
             os.makedirs(ckpt_dir, exist_ok=True)
         os.makedirs(self.cfg.log_dir, exist_ok=True)
-        global_step = 0
-        for epoch in range(1, self.cfg.epochs + 1):
+        global_step = self.global_step
+        for epoch in range(self.start_epoch, self.cfg.epochs + 1):
             steps_per_epoch = tf.data.experimental.cardinality(ds).numpy()
             total_steps = steps_per_epoch if steps_per_epoch and steps_per_epoch > 0 else None
             pbar = tqdm(ds, total=total_steps, desc=f"Epoch {epoch}", leave=False, file=sys.stdout, dynamic_ncols=True)
@@ -536,7 +619,7 @@ class Trainer:
                         f"{train_vals['loss']:.6f},{train_vals['box']:.6f},{train_vals['obj']:.6f},{train_vals['cls']:.6f},{train_vals['quality']:.6f},"
                         f"{0.0:.6f},{0.0:.6f}\n"
                     )
-            self._save_last(epoch, map_value=val_map_val)
+            self._save_last(epoch, map_value=val_map_val, global_step=global_step)
             print(f"Finished epoch {epoch}")
 
     def _run_eval(self, val_ds, epoch: int = 0) -> dict:
@@ -636,11 +719,12 @@ class Trainer:
         self._prune_dir(self.best_dir, prefix=prefix, keep=10)
         print(f"Saved best checkpoint to {path}.keras ({metric_name}={metric_value:.5f})")
 
-    def _save_last(self, epoch: int, map_value: float = 0.0):
+    def _save_last(self, epoch: int, map_value: float = 0.0, global_step: int = 0):
         base = f"last_utod_{epoch:04d}_map_{map_value:.5f}"
         path = os.path.join(self.last_dir, base)
         self._save_weights(path)
         self._save_saved_model(path)
+        self._save_state(epoch, global_step)
         self._prune_dir(self.last_dir, prefix="last_", keep=10)
 
     def _prune_dir(self, directory: str, prefix: str, keep: int = 10):
@@ -917,61 +1001,73 @@ def main():
         args.resize_mode = "keras_bilinear"
     if args.keras_nearest:
         args.resize_mode = "keras_nearest"
-    cfg = TrainConfig(
-        image_dir=args.image_dir,
-        names_path=args.names_path,
-        num_classes=args.num_classes,
-        classes=args.classes,
-        aug_config=args.aug_config,
-        use_augment=not args.no_aug,
-        exp_name=args.exp_name,
-        train_split=args.train_split,
-        val_split=args.val_split,
-        seed=args.seed,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        img_size=_parse_img_size(args.img_size),
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-        log_interval=args.log_interval,
-        eval_interval=args.eval_interval,
-        ckpt_out=args.ckpt_out,
-        resume=args.resume,
-        teacher_ckpt=args.teacher_ckpt,
-        distill_weight=args.distill_weight,
-        feature_distill_weight=args.feature_distill_weight,
-        use_ema=args.use_ema,
-        ema_decay=args.ema_decay,
-        use_amp=args.use_amp,
-        use_xla=args.use_xla,
-        resize_mode=args.resize_mode,
-        max_boxes=args.max_boxes,
-        use_residual=args.use_residual or args.utod_residual,
-        use_improved_head=args.use_improved_head,
-        use_head_ese=args.use_head_ese or args.utod_head_ese,
-        use_iou_aware_head=args.use_iou_aware_head,
-        quality_power=args.quality_power,
-        cls_bottleneck_ratio=args.cls_bottleneck_ratio,
-        anchors=args.anchors,
-        auto_anchors=args.auto_anchors,
-        num_anchors=args.num_anchors,
-        c_stem=args.cnn_width,
-        cnn_width=args.cnn_width,
-        activation=args.activation,
-        assigner=args.assigner,
-        iou_loss=args.iou_loss,
-        cls_loss_type=args.cls_loss_type,
-        simota_topk=args.simota_topk,
-        use_batchnorm=args.use_batchnorm,
-        grad_clip_norm=args.grad_clip_norm,
-        log_dir=args.log_dir,
-        num_workers=args.num_workers,
-        utod_head_ese=args.utod_head_ese or args.use_head_ese,
-        utod_large_obj_branch=args.utod_large_obj_branch,
-        utod_large_obj_depth=args.utod_large_obj_depth,
-        utod_large_obj_ch_scale=args.utod_large_obj_ch_scale,
-        conf_thresh=args.conf_thresh,
-    )
+    defaults = parser.parse_args([])
+    resume_cfg, resume_log_path = _load_resume_config(args.resume)
+    if resume_cfg:
+        print(f"Loaded config from {resume_log_path}. CLI overrides will be applied.")
+    elif args.resume:
+        msg = f"No train.log found for resume path {args.resume}." if resume_log_path is None else f"Failed to parse {resume_log_path}; using CLI defaults."
+        print(msg)
+
+    def set_field(cfg_dict, name, arg_val, default_val, transform=lambda x: x):
+        if name not in cfg_dict or arg_val != default_val:
+            cfg_dict[name] = transform(arg_val)
+
+    cfg_dict = dict(resume_cfg) if resume_cfg else {}
+    set_field(cfg_dict, "image_dir", args.image_dir, defaults.image_dir)
+    set_field(cfg_dict, "names_path", args.names_path, defaults.names_path)
+    set_field(cfg_dict, "num_classes", args.num_classes, defaults.num_classes)
+    set_field(cfg_dict, "classes", args.classes, defaults.classes)
+    set_field(cfg_dict, "aug_config", args.aug_config, defaults.aug_config)
+    set_field(cfg_dict, "use_augment", not args.no_aug, not defaults.no_aug)
+    set_field(cfg_dict, "exp_name", args.exp_name, defaults.exp_name)
+    set_field(cfg_dict, "train_split", args.train_split, defaults.train_split)
+    set_field(cfg_dict, "val_split", args.val_split, defaults.val_split)
+    set_field(cfg_dict, "seed", args.seed, defaults.seed)
+    set_field(cfg_dict, "epochs", args.epochs, defaults.epochs)
+    set_field(cfg_dict, "batch_size", args.batch_size, defaults.batch_size)
+    set_field(cfg_dict, "img_size", args.img_size, defaults.img_size, _parse_img_size)
+    set_field(cfg_dict, "lr", args.lr, defaults.lr)
+    set_field(cfg_dict, "weight_decay", args.weight_decay, defaults.weight_decay)
+    set_field(cfg_dict, "log_interval", args.log_interval, defaults.log_interval)
+    set_field(cfg_dict, "eval_interval", args.eval_interval, defaults.eval_interval)
+    set_field(cfg_dict, "ckpt_out", args.ckpt_out, defaults.ckpt_out)
+    cfg_dict["resume"] = args.resume
+    set_field(cfg_dict, "teacher_ckpt", args.teacher_ckpt, defaults.teacher_ckpt)
+    set_field(cfg_dict, "distill_weight", args.distill_weight, defaults.distill_weight)
+    set_field(cfg_dict, "feature_distill_weight", args.feature_distill_weight, defaults.feature_distill_weight)
+    set_field(cfg_dict, "use_ema", args.use_ema, defaults.use_ema)
+    set_field(cfg_dict, "ema_decay", args.ema_decay, defaults.ema_decay)
+    set_field(cfg_dict, "use_amp", args.use_amp, defaults.use_amp)
+    set_field(cfg_dict, "use_xla", args.use_xla, defaults.use_xla)
+    set_field(cfg_dict, "resize_mode", args.resize_mode, defaults.resize_mode)
+    set_field(cfg_dict, "max_boxes", args.max_boxes, defaults.max_boxes)
+    set_field(cfg_dict, "use_residual", args.use_residual or args.utod_residual, defaults.use_residual or defaults.utod_residual)
+    set_field(cfg_dict, "use_improved_head", args.use_improved_head, defaults.use_improved_head)
+    set_field(cfg_dict, "use_head_ese", args.use_head_ese or args.utod_head_ese, defaults.use_head_ese or defaults.utod_head_ese)
+    set_field(cfg_dict, "use_iou_aware_head", args.use_iou_aware_head, defaults.use_iou_aware_head)
+    set_field(cfg_dict, "quality_power", args.quality_power, defaults.quality_power)
+    set_field(cfg_dict, "cls_bottleneck_ratio", args.cls_bottleneck_ratio, defaults.cls_bottleneck_ratio)
+    set_field(cfg_dict, "anchors", args.anchors, defaults.anchors)
+    set_field(cfg_dict, "auto_anchors", args.auto_anchors, defaults.auto_anchors)
+    set_field(cfg_dict, "num_anchors", args.num_anchors, defaults.num_anchors)
+    set_field(cfg_dict, "c_stem", args.cnn_width, defaults.cnn_width)
+    set_field(cfg_dict, "cnn_width", args.cnn_width, defaults.cnn_width)
+    set_field(cfg_dict, "activation", args.activation, defaults.activation)
+    set_field(cfg_dict, "assigner", args.assigner, defaults.assigner)
+    set_field(cfg_dict, "iou_loss", args.iou_loss, defaults.iou_loss)
+    set_field(cfg_dict, "cls_loss_type", args.cls_loss_type, defaults.cls_loss_type)
+    set_field(cfg_dict, "simota_topk", args.simota_topk, defaults.simota_topk)
+    set_field(cfg_dict, "use_batchnorm", args.use_batchnorm, defaults.use_batchnorm)
+    set_field(cfg_dict, "grad_clip_norm", args.grad_clip_norm, defaults.grad_clip_norm)
+    set_field(cfg_dict, "log_dir", args.log_dir, defaults.log_dir)
+    set_field(cfg_dict, "num_workers", args.num_workers, defaults.num_workers)
+    set_field(cfg_dict, "utod_head_ese", args.utod_head_ese or args.use_head_ese, defaults.utod_head_ese or defaults.use_head_ese)
+    set_field(cfg_dict, "utod_large_obj_branch", args.utod_large_obj_branch, defaults.utod_large_obj_branch)
+    set_field(cfg_dict, "utod_large_obj_depth", args.utod_large_obj_depth, defaults.utod_large_obj_depth)
+    set_field(cfg_dict, "utod_large_obj_ch_scale", args.utod_large_obj_ch_scale, defaults.utod_large_obj_ch_scale)
+    set_field(cfg_dict, "conf_thresh", args.conf_thresh, defaults.conf_thresh)
+    cfg = TrainConfig(**cfg_dict)
     trainer = Trainer(cfg)
     trainer.train()
 
