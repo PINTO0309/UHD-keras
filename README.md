@@ -4,6 +4,7 @@
 Keras reimplementation of the UHD `ultratinyod` training pipeline. The goal is to keep the original training flow (anchors, SimOTA/legacy assigner, IoU-aware heads, improved head, and quality-aware scoring) while restricting the scope to the `ultratinyod` architecture. Distillation supports only UltraTinyOD teacher→student; transformer teachers are intentionally unsupported. EMA tracking and multiple resize backends are available.
 
 - Ref
+  - https://github.com/PINTO0309/UHD
   - https://github.com/tensorflow/tflite-micro
   - https://github.com/espressif/esp-tflite-micro
 
