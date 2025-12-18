@@ -215,7 +215,7 @@ def _targets_from_batch(
         class_table = tf.lookup.StaticHashTable(initializer, default_value=-1)
 
     if class_table is not None:
-        mapped = class_table.lookup(labels_ragged)
+        mapped = tf.ragged.map_flat_values(class_table.lookup, labels_ragged)
         keep = mapped >= 0
         boxes_ragged = tf.ragged.boolean_mask(boxes_ragged, keep)
         labels_ragged = tf.ragged.boolean_mask(mapped, keep)
