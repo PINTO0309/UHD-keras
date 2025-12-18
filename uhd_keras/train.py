@@ -190,26 +190,42 @@ def _collect_paths(input_path: Union[str, Sequence[str]]) -> List[str]:
     with open(input_path, "r", encoding="utf-8") as f:
         return [line.strip() for line in f if line.strip()]
 
-def _targets_from_batch(batch, class_map: Optional[dict] = None) -> List[dict]:
-    targets = []
-    num = batch["num_boxes"]
-    boxes = batch["boxes"]
-    labels = batch["labels"]
-    bsz = int(boxes.shape[0])
-    max_boxes = boxes.shape[1]
+def _targets_from_batch(
+    batch,
+    class_map: Optional[dict] = None,
+    class_table: Optional[tf.lookup.StaticHashTable] = None,
+) -> List[dict]:
+    """Convert batched boxes/labels to per-sample targets using TF ops only."""
+    num = tf.cast(tf.convert_to_tensor(batch["num_boxes"]), tf.int32)
+    boxes = tf.convert_to_tensor(batch["boxes"])
+    labels = tf.cast(tf.convert_to_tensor(batch["labels"]), tf.int32)
+
+    # ragged view to respect per-sample num_boxes
+    boxes_ragged = tf.RaggedTensor.from_tensor(boxes, lengths=num)
+    labels_ragged = tf.RaggedTensor.from_tensor(labels, lengths=num)
+
+    if class_table is None and class_map:
+        # build a table on the fly if not provided
+        keys = list(class_map.keys())
+        values = [class_map[k] for k in keys]
+        initializer = tf.lookup.KeyValueTensorInitializer(
+            keys=tf.constant(keys, dtype=tf.int32),
+            values=tf.constant(values, dtype=tf.int32),
+        )
+        class_table = tf.lookup.StaticHashTable(initializer, default_value=-1)
+
+    if class_table is not None:
+        mapped = class_table.lookup(labels_ragged)
+        keep = mapped >= 0
+        boxes_ragged = tf.ragged.boolean_mask(boxes_ragged, keep)
+        labels_ragged = tf.ragged.boolean_mask(mapped, keep)
+
+    bsz = int(boxes.shape[0]) if boxes.shape[0] is not None else int(tf.shape(boxes)[0])
+    targets: List[dict] = []
     for i in range(bsz):
-        n = int(num[i].numpy()) if hasattr(num[i], "numpy") else int(num[i])
-        n = max(0, min(n, max_boxes))
-        box_np = boxes[i].numpy()[:n]
-        label_np = labels[i].numpy()[:n].astype(np.int32)
-        if class_map:
-            keep = [idx for idx, l in enumerate(label_np) if int(l) in class_map]
-            if len(keep) == 0:
-                targets.append({"boxes": tf.zeros((0, 4), dtype=boxes.dtype), "labels": tf.zeros((0,), dtype=tf.int32)})
-                continue
-            box_np = box_np[keep]
-            label_np = np.array([class_map[int(label_np[k])] for k in keep], dtype=np.int32)
-        targets.append({"boxes": tf.convert_to_tensor(box_np, dtype=boxes.dtype), "labels": tf.convert_to_tensor(label_np, dtype=tf.int32)})
+        b_i = tf.convert_to_tensor(boxes_ragged[i], dtype=boxes.dtype)
+        l_i = tf.cast(tf.convert_to_tensor(labels_ragged[i], dtype=tf.int32), tf.int32)
+        targets.append({"boxes": b_i, "labels": l_i})
     return targets
 
 
@@ -382,6 +398,15 @@ class Trainer:
         else:
             self.num_classes = _resolve_num_classes(cfg.num_classes, cfg.names_path)
         self.class_map = {cid: idx for idx, cid in enumerate(self.class_ids)} if self.class_ids else None
+        self.class_table = None
+        if self.class_map:
+            map_keys = list(self.class_map.keys())
+            map_vals = [self.class_map[k] for k in map_keys]
+            initializer = tf.lookup.KeyValueTensorInitializer(
+                keys=tf.constant(map_keys, dtype=tf.int32),
+                values=tf.constant(map_vals, dtype=tf.int32),
+            )
+            self.class_table = tf.lookup.StaticHashTable(initializer, default_value=-1)
         anchors = _parse_anchors(cfg.anchors)
         if cfg.auto_anchors:
             anchors = self._auto_compute_anchors(cfg.image_dir, cfg.num_anchors)
@@ -546,7 +571,7 @@ class Trainer:
             train_vals = {"loss": 0.0, "box": 0.0, "obj": 0.0, "cls": 0.0, "quality": 0.0}
             for batch in pbar:
                 global_step += 1
-                targets = _targets_from_batch(batch, class_map=self.class_map)
+                targets = _targets_from_batch(batch, class_map=self.class_map, class_table=self.class_table)
                 loss, loss_dict = self.train_step_fn(batch, targets)
                 if self.ema:
                     self.ema.update()
@@ -629,7 +654,7 @@ class Trainer:
         gt_store = {}
         img_offset = 0
         for batch in tqdm(val_ds, desc=f"Val {epoch}", leave=False, file=sys.stdout, dynamic_ncols=True):
-            targets = _targets_from_batch(batch, class_map=self.class_map)
+            targets = _targets_from_batch(batch, class_map=self.class_map, class_table=self.class_table)
             raw, decoded = self.model(batch["image"], training=False, decode=True)
             loss_dict = anchor_loss(
                 raw,
@@ -863,8 +888,9 @@ class Trainer:
         fwd_fn = self.fwd_fn
 
         if jit:
-            print("Warning: XLA/graph mode is not fully supported; running eager train step instead.")
+            print("Warning: XLA/graph mode is not fully supported; enabling jit_compile anyway.")
 
+        @tf.function(reduce_retracing=True, jit_compile=jit)
         def step(batch, targets):
             with tf.GradientTape() as tape:
                 pred, feat = fwd_fn(batch["image"])

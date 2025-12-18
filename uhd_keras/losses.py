@@ -36,6 +36,8 @@ def anchor_loss(
     w = tf.shape(pred)[2]
     h_int = int(pred.shape[1]) if pred.shape[1] is not None else None
     w_int = int(pred.shape[2]) if pred.shape[2] is not None else None
+    h_val = tf.cast(h, tf.int32) if h_int is None else tf.constant(h_int, dtype=tf.int32)
+    w_val = tf.cast(w, tf.int32) if w_int is None else tf.constant(w_int, dtype=tf.int32)
     na = tf.shape(anchors)[0]
     extra = 1 if use_quality else 0
     pred = tf.reshape(pred, (b, h, w, na, 5 + extra + num_classes))
@@ -70,13 +72,14 @@ def anchor_loss(
     if assigner not in ("legacy", "simota"):
         raise ValueError(f"Unknown assigner: {assigner}")
 
-    obj_indices = []
-    obj_values = []
-    cls_indices = []
-    cls_values = []
-    box_indices = []
-    box_values = []
-    qual_indices = []
+    obj_ta = tf.TensorArray(tf.int32, size=0, dynamic_size=True, clear_after_read=False)
+    obj_val_ta = tf.TensorArray(pred.dtype, size=0, dynamic_size=True, clear_after_read=False)
+    cls_idx_ta = tf.TensorArray(tf.int32, size=0, dynamic_size=True, clear_after_read=False)
+    cls_val_ta = tf.TensorArray(pred.dtype, size=0, dynamic_size=True, clear_after_read=False)
+    box_idx_ta = tf.TensorArray(tf.int32, size=0, dynamic_size=True, clear_after_read=False)
+    box_val_ta = tf.TensorArray(pred.dtype, size=0, dynamic_size=True, clear_after_read=False)
+    qual_idx_ta = tf.TensorArray(tf.int32, size=0, dynamic_size=True, clear_after_read=False) if use_quality else None
+    obj_count = 0
 
     for bi, tgt in enumerate(targets):
         boxes = tf.cast(tf.convert_to_tensor(tgt.get("boxes", [])), pred.dtype)
@@ -95,70 +98,78 @@ def anchor_loss(
             union = (awh[:, :, 0] * awh[:, :, 1]) + (wh[tf.newaxis, :, 0] * wh[tf.newaxis, :, 1]) - inter + 1e-7
             anchor_iou = inter / union  # A,G
             best_anchor = tf.cast(tf.argmax(anchor_iou, axis=0), tf.int32)
-            boxes_len = int(tf.shape(boxes)[0])
-            for idx in range(boxes_len):
-                gi = int(gis[idx])
-                gj = int(gjs[idx])
-                if w_int is not None and (gi < 0 or gi >= w_int):
-                    continue
-                if h_int is not None and (gj < 0 or gj >= h_int):
-                    continue
-                a = int(best_anchor[idx])
-                cls_id = int(labels[idx])
-                obj_indices.append([bi, a, gj, gi])
-                obj_values.append(1.0)
-                cls_indices.append([bi, a, gj, gi])
+            boxes_len = tf.shape(boxes)[0]
+            for idx in tf.range(boxes_len):
+                gi = tf.cast(gis[idx], tf.int32)
+                gj = tf.cast(gjs[idx], tf.int32)
+                a = tf.cast(best_anchor[idx], tf.int32)
+                cls_id = tf.cast(labels[idx], tf.int32)
+                idx_vec = tf.stack([bi, a, gj, gi])
+                obj_ta = obj_ta.write(obj_count, idx_vec)
+                obj_val_ta = obj_val_ta.write(obj_count, tf.constant(1.0, dtype=pred.dtype))
+                cls_idx_ta = cls_idx_ta.write(obj_count, idx_vec)
                 cls_vec = tf.one_hot(cls_id, num_classes, dtype=pred.dtype)
-                cls_values.append(cls_vec)
-                box_indices.append([bi, a, gj, gi])
-                box_values.append(boxes[idx])
-                if use_quality:
-                    qual_indices.append([bi, a, gj, gi])
+                cls_val_ta = cls_val_ta.write(obj_count, cls_vec)
+                box_idx_ta = box_idx_ta.write(obj_count, idx_vec)
+                box_val_ta = box_val_ta.write(obj_count, boxes[idx])
+                if use_quality and qual_idx_ta is not None:
+                    qual_idx_ta = qual_idx_ta.write(obj_count, idx_vec)
+                obj_count += 1
         else:  # simota
             pb = tf.reshape(pred_box[bi], (-1, 4))
             pb = tf.clip_by_value(tf.where(tf.math.is_finite(pb), pb, 0.0), 0.0, 10.0)
             boxes_clean = tf.clip_by_value(tf.where(tf.math.is_finite(boxes), boxes, 0.0), 0.0, 1.0)
             ious = pairwise_iou(pb, boxes_clean)  # N,G
-            grid_size = h_int * w_int
+            grid_size = h_val * w_val
             for gt_idx in range(tf.shape(boxes_clean)[0]):
                 cls_id = int(labels[gt_idx])
                 iou_g = ious[:, gt_idx]
                 topk = tf.minimum(simota_topk, tf.shape(iou_g)[0])
                 topk_vals, topk_idx = tf.math.top_k(iou_g, k=topk, sorted=True)
-                dynamic_k = int(tf.minimum(topk, tf.maximum(tf.reduce_sum(topk_vals), 1.0)).numpy())
+                dynamic_k = tf.cast(tf.minimum(topk, tf.maximum(tf.reduce_sum(topk_vals), 1.0)), tf.int32)
                 selected = topk_idx[:dynamic_k]
-                for idx in selected.numpy().tolist():
-                    a = idx // grid_size
-                    rem = idx % grid_size
-                    gj = rem // w_int
-                    gi = rem % w_int
-                    obj_indices.append([bi, a, gj, gi])
-                    obj_values.append(1.0)
-                    cls_indices.append([bi, a, gj, gi])
+                for idx in tf.range(tf.shape(selected)[0]):
+                    sel = selected[idx]
+                    a = sel // grid_size
+                    rem = sel % grid_size
+                    gj = rem // w_val
+                    gi = rem % w_val
+                    idx_vec = tf.stack([bi, a, gj, gi])
+                    obj_ta = obj_ta.write(obj_count, idx_vec)
+                    obj_val_ta = obj_val_ta.write(obj_count, tf.constant(1.0, dtype=pred.dtype))
+                    cls_idx_ta = cls_idx_ta.write(obj_count, idx_vec)
                     cls_vec = tf.one_hot(cls_id, num_classes, dtype=pred.dtype)
-                    cls_values.append(cls_vec)
-                    box_indices.append([bi, a, gj, gi])
-                    box_values.append(boxes_clean[gt_idx])
-                    if use_quality:
-                        qual_indices.append([bi, a, gj, gi])
+                    cls_val_ta = cls_val_ta.write(obj_count, cls_vec)
+                    box_idx_ta = box_idx_ta.write(obj_count, idx_vec)
+                    box_val_ta = box_val_ta.write(obj_count, boxes_clean[gt_idx])
+                    if use_quality and qual_idx_ta is not None:
+                        qual_idx_ta = qual_idx_ta.write(obj_count, idx_vec)
+                    obj_count += 1
 
-    if obj_indices:
-        obj_indices_tf = tf.constant(obj_indices, dtype=tf.int32)
-        obj_values_tf = tf.constant(obj_values, dtype=pred.dtype)
-        target_obj = tf.tensor_scatter_nd_update(target_obj, obj_indices_tf, obj_values_tf)
+    count = obj_ta.size()
 
-        cls_indices_tf = tf.constant(cls_indices, dtype=tf.int32)
-        cls_values_tf = tf.stack(cls_values, axis=0)
-        target_cls = tf.tensor_scatter_nd_update(target_cls, cls_indices_tf, cls_values_tf)
+    def _apply_updates():
+        obj_indices_tf = obj_ta.stack()
+        obj_values_tf = obj_val_ta.stack()
+        cls_indices_tf = cls_idx_ta.stack()
+        cls_values_tf = cls_val_ta.stack()
+        box_indices_tf = box_idx_ta.stack()
+        box_values_tf = box_val_ta.stack()
 
-        box_indices_tf = tf.constant(box_indices, dtype=tf.int32)
-        box_values_tf = tf.stack(box_values, axis=0)
-        target_box = tf.tensor_scatter_nd_update(target_box, box_indices_tf, box_values_tf)
+        updated_obj = tf.tensor_scatter_nd_update(target_obj, obj_indices_tf, obj_values_tf)
+        updated_cls = tf.tensor_scatter_nd_update(target_cls, cls_indices_tf, cls_values_tf)
+        updated_box = tf.tensor_scatter_nd_update(target_box, box_indices_tf, box_values_tf)
+        updated_quality = target_quality
+        if use_quality and qual_idx_ta is not None:
+            qual_indices_tf = qual_idx_ta.stack()
+            qual_values_tf = tf.ones((tf.shape(qual_indices_tf)[0],), dtype=pred.dtype)
+            updated_quality = tf.tensor_scatter_nd_update(target_quality, qual_indices_tf, qual_values_tf)
+        return updated_obj, updated_cls, updated_box, updated_quality
 
-        if use_quality and qual_indices:
-            qual_indices_tf = tf.constant(qual_indices, dtype=tf.int32)
-            qual_values_tf = tf.ones((len(qual_indices),), dtype=pred.dtype)
-            target_quality = tf.tensor_scatter_nd_update(target_quality, qual_indices_tf, qual_values_tf)
+    def _no_updates():
+        return target_obj, target_cls, target_box, target_quality
+
+    target_obj, target_cls, target_box, target_quality = tf.cond(count > 0, _apply_updates, _no_updates)
 
     bce = tf.nn.sigmoid_cross_entropy_with_logits
     obj_loss = tf.reduce_mean(bce(labels=target_obj, logits=obj_logit))
