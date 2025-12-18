@@ -465,8 +465,15 @@ class Trainer:
         self.writer = tf.summary.create_file_writer(cfg.log_dir)
         self.text_log_path = os.path.join(cfg.log_dir, "train.log")
         os.makedirs(cfg.log_dir, exist_ok=True)
+        log_cfg = dict(cfg.__dict__)
+        log_cfg["optimizer"] = {
+            "name": "AdamW",
+            "params": {"learning_rate": cfg.lr, "weight_decay": cfg.weight_decay},
+        }
+        if cfg.use_amp:
+            log_cfg["optimizer"]["wrapper"] = "mixed_precision.LossScaleOptimizer"
         with open(self.text_log_path, "w", encoding="utf-8") as f:
-            f.write(json.dumps(cfg.__dict__, indent=2) + "\n")
+            f.write(json.dumps(log_cfg, indent=2) + "\n")
             f.write("epoch,loss,box,obj,cls,quality,val_loss,val_map\n")
         self.ckpt_base = cfg.ckpt_out or os.path.join("runs", cfg.exp_name or "ultratinyod")
         self.best_dir = self.ckpt_base
